@@ -12,8 +12,6 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 
 ### 📚 相关支持文档
 - [鸿蒙 NEXT 状态管理与下拉刷新架构最佳实践](references/state_management_and_refresh_patterns.md) — 针对多页面状态联动同步、AppStorage 响应式数据流、下拉刷新组件防漏及本地 preferences 离线缓存保底的最佳实践沉淀。
-- [真机部署：UDID 不是序列号](references/device-deploy-and-udid-check.md) — debug profile 白名单校验的是 UDID 而非 hdc 序列号；部署前先用脚本解析 .p7b 查白名单与有效期，避免白折腾。含真机 vs 模拟器行为差异（软键盘遮挡底部按钮）与凭据校验方式。
-- [uitest 自动化验证：让坐标和日志别骗你](references/ui-automation-testing-pitfalls.md) — 坐标随布局变须重新 dump、占位符在 `hint` 字段、dump 时序、分步确认、以及最隐蔽的一类错误「误读日志变量名」。
 - [鸿蒙 APP 代码审查与功能测试方法论](references/code_review_methodology.md) — 系统性审查已有鸿蒙APP代码的流程：数据流追踪 → 响应式链路验证 → 自动刷新生命周期审计 → 预测/积分结算逻辑验证 → 结构化测试报告生成。
 - [WebSocket 断线重连与流式消息优化模式](references/websocket_reconnect_patterns.md) — 小Q APP聊天实战沉淀：断线分阶段消息策略（温和占位→超时兜底）、sync_pending精确标签替换（禁用pop）、定时器全生命周期接管。
 
@@ -199,10 +197,6 @@ D:\Program Files\Huawei\DevEco Studio\tools\node\node.exe  (v18.20.1)
 hvigorw 需要 node，不设会报 `NODE_HOME is not set and no 'node' command found in PATH`。
 
 ### 连接真机
-
-> ⚠️ **`hdc list targets` 显示的是序列号，不是 UDID**。AGC 签名 profile 的白名单校验 UDID（64 位串），
-> 用序列号去比对会得出「设备没注册」的错误结论。查询与白名单校验的完整流程见
-> `references/device-deploy-and-udid-check.md`。
 
 1. 手机上：设置→关于手机→连续点击版本号7次（开开发者模式）
 2. 设置→系统和更新→开发人员选项→USB调试→开启
@@ -3308,67 +3302,3 @@ DialogLayer() {
 ```
 
 **规则**：传递 `bindContentCover` 的第一个参数必须是直接的 `@State` 布尔变量，不能是表达式。
-
-### 38. 键盘遮挡输入栏的**真正根因**：`setKeyboardAvoidMode` 必须等窗口就绪
-
-**症状**：输入时软键盘把底部输入栏（含按钮）盖住，**怎么改布局都没用**。
-
-**根因**（实测 BizError `code: 1300002` = `This window state is abnormal`）：
-
-```ts
-// ✗ 错：onWindowStageCreate 开头同步取窗口 —— 那一刻窗口还没就绪
-onWindowStageCreate(windowStage) {
-  const win = windowStage.getMainWindowSync();     // 抛 1300002
-  win.getUIContext().setKeyboardAvoidMode(...);    // 设置从未生效
-  windowStage.loadContent('pages/ChatPage', ...);
-}
-```
-
-```ts
-// ✓ 对：loadContent 之后 + 异步 getMainWindow()
-onWindowStageCreate(windowStage) {
-  windowStage.loadContent('pages/ChatPage', (err) => {
-    if (err.code) return;
-    windowStage.getMainWindow().then((win) => {
-      win.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET);
-      win.on('keyboardHeightChange', (h: number) => AppStorage.setOrCreate('kbHeight', h));
-    });
-  });
-}
-```
-
-- 要 `OFFSET`（整页上移）；`RESIZE` 会压缩布局，把输入栏压到键盘下方。
-- 验证别靠肉眼：`hilog.error` 打点 → `hdc shell hilog -x | grep <TAG>`。
-  要看到 `avoid mode OFFSET ok`；若出现 `{"code":1300002}` 说明时机仍不对。
-  `keyboardHeightChange` 给键盘真实高度（Pura 90 模拟器实测 1099px，屏高 2856）。
-- 判定避让成功：键盘顶边 = 屏高 − 键盘高；`dumpLayout` 里 APP `root` 完全落在该线之上即成功。
-- ⚠️ **模拟器键盘是全屏窗口**（dump 显示 `y=137..2856` 占满屏），与真机半屏键盘不同，
-  且会盖住 APP 的 dump 元素。避让效果以真机为准。
-
-### 39. `TextArea` 有框架内定最小高度，压不到一行
-
-`constraintSize({minHeight})` 和显式 `.height()` 都压不下来（实测）：
-
-| 写法 | 实际高度 |
-|---|---|
-| `constraintSize({minHeight: 44})` | 154px |
-| `constraintSize({minHeight: 24})` | 136px |
-| 去掉内层上下 padding + `minHeight: 24` | **122px**（这组最小） |
-| `.height(44)` | 154px（无效） |
-
-- 真一行只能用 **`TextInput`**（代价：无多行输入）。
-- 要「输入随内容长高」只能用 `TextArea`，接受其最小高度（≈122px 起）。
-- 调大 `maxHeight`（300 ≈ 10 行）满足「输入 10 行就是 10 行高」。
-- padding 交给**外层容器**；`TextArea` 自身别设上下 padding，会叠加顶高最小高度。
-
-### 40. 用户不在场时自己验证 UI 的可靠手法
-
-1. `hdc install -r` → `aa force-stop <bundle>` → `aa start -a EntryAbility -b <bundle>` 冷启
-2. `uitest uiInput inputText <x> <y> 'text'` 强制聚焦并触发键盘
-   （⚠️ `uitest uiInput click` 对输入框**无效**，点了键盘不弹）
-3. `uitest dumpLayout -p /data/local/tmp/x.json` → `cat` 出来用 Python 解析 bounds
-4. `uitest uiInput keyEvent Back` 收键盘
-5. ⚠️ dump 里 `text` 节点的 bounds 常是「文字可绘制区」而非控件区
-   （设 `width(32)` 的按钮实测报 112）—— 控件尺寸别只信 dump
-6. ⚠️ **编译失败时装的仍是旧版**：只看 "install successfully" 会误判改动生效，
-   必须同时抓 `BUILD SUCCESSFUL|Error Message`
