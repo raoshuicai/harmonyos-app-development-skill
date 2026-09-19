@@ -68,7 +68,7 @@ harmonyos-app-development-skill/
 
 ```bash
 # 克隆本仓库
-git clone https://github.com/xiaoqagent/harmonyos-app-development-skill.git
+git clone https://github.com/raoshuicai/harmonyos-app-development-skill.git
 
 # 打开 SKILL.md 开始阅读
 # 或导入到 Hermes Agent 作为技能使用

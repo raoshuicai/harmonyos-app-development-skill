@@ -3264,7 +3264,7 @@ if (this.isPredicted(m.id)) {
 
 ### 开源发布
 
-本技能已发布为独立开源项目：**[github.com/xiaoqagent/harmonyos-app-development-skill](https://github.com/xiaoqagent/harmonyos-app-development-skill)**
+本技能已发布为独立开源项目：**[github.com/raoshuicai/harmonyos-app-development-skill](https://github.com/raoshuicai/harmonyos-app-development-skill)**
 
 包含 SKILL.md + 17 篇 references + templates/ + README + MIT License。可自由 clone 使用。
 
