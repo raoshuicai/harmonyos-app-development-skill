@@ -3372,3 +3372,248 @@ onWindowStageCreate(windowStage) {
    （设 `width(32)` 的按钮实测报 112）—— 控件尺寸别只信 dump
 6. ⚠️ **编译失败时装的仍是旧版**：只看 "install successfully" 会误判改动生效，
    必须同时抓 `BUILD SUCCESSFUL|Error Message`
+
+### 41. `request.uploadFile` 只吃**本应用沙箱**的文件 —— 相册选的原图必须先拷进 cacheDir
+
+**症状**：从相册选图上传，请求根本没发出去，直接抛：
+
+```
+The parameters check fails
+Parameter verification failed, user file can only for request.agent
+```
+
+**根因**：`request.uploadFile` 的 `files[].uri` 必须是**本应用沙箱内**的文件。
+系统选择器给的是**媒体库/文档库 URI**（`file://media/Photo/...`、`file://docs/...`），
+属于「别的应用的文件」→ 参数校验阶段就被拒。报错原意：
+`user file can only for request.agent` = **用户文件只能给 request.agent（应用自己）用**。
+
+**修法**（必须在 APP 端做，服务端无从下手）：
+
+```ts
+private copyToSandbox(ctx: common.Context, item: PickedItem): string {
+  const srcUri = item.uri;
+  // 已在沙箱内则跳过
+  if (srcUri.indexOf(ctx.cacheDir) >= 0 || srcUri.indexOf(ctx.filesDir) >= 0) return srcUri;
+
+  const dstPath = ctx.cacheDir + '/' + Date.now().toString() + '_' + item.name;
+  const src = fs.openSync(srcUri, fs.OpenMode.READ_ONLY);
+  try {
+    const dst = fs.openSync(dstPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    try { fs.copyFileSync(src.fd, dst.fd); } finally { fs.closeSync(dst); }
+  } finally { fs.closeSync(src); }
+  return 'file://' + dstPath;
+}
+```
+
+- `import { picker, fileIo as fs } from '@kit.CoreFileKit';`（`fs` 就在 CoreFileKit 里）
+- **上传完必须删临时文件**（放 `finally`，成败都删），否则 cacheDir 堆积
+- **图片和文档两个入口都要处理**：`DocumentViewPicker` 的 `file://docs/...` 同样不是沙箱文件
+- 其余逻辑别动：仍走 `request.uploadFile`，进度/重试等系统能力保留
+
+**⚠️ 编译失败时 HAP 不更新** —— `install successfully` 会照常打印，装的还是旧版。
+每次必须**同时**确认 `BUILD SUCCESSFUL` 和 `install successfully`，只看后者会误判改动生效。
+
+**⚠️ 别凭记忆写 import**：想当然写 `import { apiClient as rest } from '../core/HermesRest.ets'`
+会直接 `BUILD FAILED`（该模块导出的是 `rest`）。改多个文件前先 `git show HEAD:<path> | head -30`
+看一眼真实的 import 段。
+
+### 42. `request.uploadFile` 的 uri 必须是 `internal://cache/<文件名>`（拷进沙箱只是一半）
+
+**症状**（真机日志）：
+```
+[COPY] copyFileSync ok
+[COPY] done size=143563                                   ← 拷贝完全成功
+uploading uri=file:///data/storage/el2/base/haps/entry/cache/1789811976066_xxx.jpg
+upload threw code=401
+  "The parameters check fails / GetInternalPath failed, filePath is not valid"
+```
+
+**根因**：`request.uploadFile` 的 `files[].uri` **只接受 `internal://cache/<文件名>`**
+这种内部路径。给 `file:///data/...`（哪怕文件确实在自己沙箱的 `cacheDir` 里）
+也会被拒 —— 它按 `internal` 协议解析，报 `GetInternalPath failed`。
+
+⚠️ **拷进沙箱是必要但不充分的**：沙箱只是一半，**URI 协议是另一半**。
+   只做了拷贝、URI 仍传 `file://` 的话照样失败。
+
+**正确写法**：
+```ts
+// 选中的媒体库文件先拷进 cacheDir（file://media/Photo/... 直接传也会被拒）
+const safeName = Date.now().toString() + '_' + item.name;   // 只要文件名，不带目录
+const dstPath  = ctx.cacheDir + '/' + safeName;
+// ... fs.openSync + fs.copyFileSync 拷贝 ...
+
+// ★ uri 用 internal://cache/，不是 file://
+files: [{ filename: item.name, name: 'file', uri: 'internal://cache/' + safeName, type: 'image/jpeg' }]
+```
+
+- `internal://cache/` 后面**只能是相对 `cacheDir` 的文件名**，不能带目录。
+- 删临时文件时要把 `internal://cache/<名>` 还原成 `<cacheDir>/<名>` 再 unlink。
+- `internal://files/` 对应 `filesDir`，按需选用。
+- 官方示例：`files: [{ filename:'test', name:'test', uri:'internal://cache/test.jpg', type:'jpg' }]`
+
+**排查手法（照着做就能定位）**：把「拷进沙箱」每一步都打 `hilog.error`（openSync fd /
+copyFileSync / 目标文件 size），再把 `uploadFile` 的 catch 打成 **code + message**
+（只打 message 区分不出参数校验失败和网络失败）。这次就是靠 `[COPY] done size=143563`
+证明拷贝没问题、报错落在 `GetInternalPath failed` 才锁定是 URI 协议问题的。
+
+### 43. 别用 `TaskState.responseCode` 判断 `uploadFile` 成败 —— 它会误报失败
+
+**症状**：上传**其实已经成功**（服务端收到完整文件并返回 200），
+但 APP 判定失败、提示"上传失败"。
+
+**证据对照**（同一次上传，两端日志）：
+```
+# 真机
+uploading uri=internal://cache/1789..._xxx.jpg to http://192.168.3.87:8866/api/upload
+upload responseCode=0                                  ← APP 读到 0，误判失败
+# 服务端
+[Upload] screenshot_....jpg (1177797 bytes, image/jpeg)
+POST /api/upload HTTP/1.1 200 OK                       ← 明明 200
+```
+
+**根因**：`request.UploadTask` 的 `TaskState.responseCode` 在 `complete` 事件里
+**并不是 HTTP 状态码**（服务端返回 200 时它给 0）。
+
+**正解**：以**事件类型**判定成败，`responseCode` 只当参考日志。
+
+```ts
+let httpHint = -1;
+const ok = await new Promise<boolean>((resolve) => {
+  task.on('headerReceive', (header: object) => {      // 兜底：记录真实响应头
+    try {
+      const h = header as Record<string, string>;
+      if (h['responseCode'] !== undefined) httpHint = Number(h['responseCode']);
+    } catch (x) { /* header 结构不确定，忽略 */ }
+    hilog.error(0x0001, TAG, '[HDR] hint=%{public}d', httpHint);
+  });
+  task.on('complete', (states: Array<request.TaskState>) => {
+    const st = states.length > 0 ? states[0] : undefined;
+    hilog.error(0x0001, TAG, '[DONE] rc=%{public}d hint=%{public}d',
+                st?.responseCode ?? -1, httpHint);
+    resolve(true);          // ★ complete 即成功
+  });
+  task.on('fail', () => resolve(false));
+});
+```
+
+**排查通用套路**：上传/下载类"客户端说失败、服务端却成功"的问题，
+**先把两端日志并排看**（真机 `hilog` + 服务端 `journalctl`），
+比对"客户端判定依据"与"服务端实际响应"，通常就能定位到是判据用错了。
+
+
+## 44. S42 审批卡片：HitTestMode.Block 会废掉子节点 + @Entry 单根节点
+
+### HitTestMode 语义（SDK `enums.d.ts:8220` 原文）
+| 值 | 语义 |
+|---|---|
+| `Default` | **自身和子节点都响应**；阻止被本节点遮住的其他节点 ← 通常要的就是这个 |
+| `Block` | **只有自身响应，阻止子节点** ← 加在容器上会让里面所有按钮失效 |
+| `Transparent` | 自身响应，且不阻止子节点/其他节点 |
+| `None` | 自身不响应，子节点响应 |
+
+**实测症状**：给卡片主体加 `hitTestBehavior(HitTestMode.Block)` 想"吃掉点击防穿透"，
+结果卡片里的 ✕ 和四个选项**全部点不动**（uitest 点击无反应，dump 前后一字节未变）。
+
+**正解**：**不要这个属性** —— ArkUI 容器默认（`Default`）就会阻止被遮住的下层节点
+接收事件，本来就不需要手动"吃掉点击"。
+
+### @Entry 组件 build() 只能有一个根节点
+给页面加全局浮层（如 `ApproveLayer`）时，容易写成 Stack 的兄弟节点：
+```ts
+build() {
+  Stack() { ... }
+  .width('100%').height('100%')
+
+  ApproveLayer({...})      // ✗ 第二个根节点 → 编译失败
+}
+```
+报错：`In an '@Entry' decorated component, the 'build' method can have only one
+root node, which must be a container component.`
+**正解**：放进 Stack **内部**（写在 Stack 内容的最末尾）。
+
+### 无人值守 UI 验证：dump 字符数对比法
+验证"点击某处后 UI 是否变化"，**比对 `uitest dumpLayout` 的字符数**是最快判据：
+- 点空白后 dump `91396` chars（与点击前**完全相同**）→ 卡片没消失 ✓
+- 点 ✕ 后 dump `62458` chars（缩小 32%）→ 卡片收起 ✓
+
+比逐字段比对快得多，且能发现"完全没反应"这类静默失败（比如上面那个 Block 坑）。
+
+### PowerShell 脚本里的中文会乱码
+Windows PowerShell 5.1 按 GBK 读 `.ps1`（无 BOM 时）→ 脚本内中文关键词变乱码、
+语法解析失败（报一堆 `UnexpectedToken`）。
+**正解**：`.ps1` 保持**纯 ASCII**（只做 hdc / curl 操作），中文关键词的分析交给
+**Python 脚本**（`io.open(p, encoding='utf-8', errors='replace')` 读 dump 再 `in` 判断）。
+
+### dump 的 bounds 用正则抓更省事
+`uitest dumpLayout` 的 JSON 结构随版本变，直接 `json.loads` 再递归有时不稳。
+**兜底**：正则从原文抓目标节点的 bounds，再算中心点给 `uitest uiInput click`：
+```python
+m = re.search(r'\{[^{}]*"text"\s*:\s*"✕"[^{}]*\}', raw)
+b = re.search(r'"bounds"\s*:\s*"\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', m.group(0))
+x = (int(b.group(1)) + int(b.group(3))) // 2
+y = (int(b.group(2)) + int(b.group(4))) // 2
+```
+
+
+## 45. S43 APP 侧开启 Hermes 会话级 YOLO（审批跳过）
+
+### 背景：为什么 APP 里发 `/yolo` 没用
+YOLO 是 Hermes 的**会话级**审批跳过开关，存在 `tools/approval.py` 的
+`_session_yolo` 集合里（按 session_key，**纯内存**）。唯一原入口是 gateway 的
+`/yolo` slash 命令（`gateway/slash_commands.py:_handle_yolo_command`），
+它要的是**消息平台**的 `MessageEvent`。
+
+APP 走 `POST /v1/chat/completions`，而 `api_server.py` **完全不调用 slash 处理**
+（grep 零命中）→ 在 APP 里发 `/yolo` 只是普通文本（实测模型把它当问题回答了）。
+
+### 关键：YOLO 挂在哪个 session_key 上
+```
+api_server.py:4090   effective_task_id = session_id or str(uuid.uuid4())
+api_server.py:4098   set_current_session_key(effective_task_id)   # _approval_key
+```
+而 `session_id` 来自 **`X-Hermes-Session-Id`** header（xiaoq-api 发的就是它）。
+新会话时 xiaoq-api 生成 `"app-" + uuid4().hex[:16]`，通过 `chat_started` 回执给 APP。
+
+**所以：APP 点 YOLO 开关时，若 `activeSessionId` 为空，要按同格式自己补一个**
+（`app-` + 16 位随机 hex），否则 chat 通道和 YOLO 通道会落在两个不同 key 上。
+
+⚠️ 注意 `/v1/runs` 路径的 key 是 `run_id`（api_server.py:4310），和 chat 路径不同 ——
+两个通道的 YOLO 不通用。
+
+### 服务端：新增 `/v1/session/yolo` 端点（本地补丁）
+Gateway 的 `api_server.py` 路由是 `self._app.router.add_get/add_post(...)` 形式
+（不是 `@app.get`）。补丁内容：
+- handler `_handle_session_yolo`：`_check_auth` → 取 `X-Hermes-Session-Key`（优先）
+  或 `X-Hermes-Session-Id`（退回）→ GET 返回 `{session_key, yolo}` /
+  POST body `{enabled}`（不带则 toggle）→ 调 `enable_session_yolo/disable_session_yolo`
+- 注册 `GET`+`POST /v1/session/yolo`（插在 `/v1/runs/{run_id}/stop` 之后）
+
+**补丁归档**：存 `~/.hermes/patches/yolo-session-endpoint.patch`。
+`reapply-hermes-patches.sh` 用 `for patch in "$PATCHES_DIR"/*.patch` 自动遍历，
+**新增补丁不用改脚本**。
+
+**xiaoq-api 侧零改动** —— 它已有通用代理 `@app.api_route("/v1/{path:path}")`，
+透传全部 header，所以 APP 直接调 `/v1/session/yolo` 就能经它到 Gateway。
+
+### APP 侧：Y 气泡
+- `HermesRest.get()` 原本不支持自定义 header（`post` 支持）→ 加可选
+  `extraHeaders` 参数，否则查询状态时没法带 `X-Hermes-Session-Id`
+- `InputBar`：`@Prop yoloOn` + `onToggleYolo`；气泡插在 `Text('＋')` 与 `Blank()`
+  之间（缩进 12/14 空格），默认 `btn_circle_bg` 白底 + `btn_circle_fg` 黑字，
+  开启后 `brand` 主题色底 + `text_on_brand` 白字 —— 与 ↑ 的配色规则保持一致
+- `ChatPage`：`@State yoloOn` + `ensureSessionId()` / `refreshYolo()` / `toggleYolo()`，
+  `onPageShow` 同步一次（Gateway 侧是内存态，重启会清）
+
+### 验证手法（对照实验最有力）
+用脚本对同一类危险命令做**开/不开 YOLO 的对照**，比单看 UI 状态可靠得多：
+```
+① 不开 YOLO → 发 "执行 rm -rf /tmp/xxx" → 收到 approve_request      （基线）
+② 开 YOLO   → 发同一条                → 无 approve_request，直接执行
+```
+UI 侧同理用 `uitest dumpLayout` 抓气泡的 `background`：
+点击前 `#FFFFFFFF` → 点击后 `#FF4F46E5`（主题色）。
+
+### 重启 Gateway 后要等够
+`systemctl --user restart hermes-gateway` 后 **约 21 秒** API server 才 ready
+（日志里出现 `[Api_Server] API server is network-accessible` 为准）。
+重启后 8 秒就去 curl 会得到**空响应**，容易误判成端点没生效。
